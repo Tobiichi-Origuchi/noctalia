@@ -305,7 +305,6 @@ namespace {
     player["loop_status"] = sdbus::Variant(info.loopStatus);
     player["shuffle"] = sdbus::Variant(info.shuffle);
     player["volume"] = sdbus::Variant(info.volume);
-    player["rate"] = sdbus::Variant(info.rate);
     player["position_us"] = sdbus::Variant(info.positionUs);
     player["length_us"] = sdbus::Variant(info.lengthUs);
     player["can_control"] = sdbus::Variant(info.canControl);
@@ -506,7 +505,7 @@ void MprisService::applyPositionSample(const std::string& busName, int64_t rawPo
   const std::int64_t elapsedSinceTrackChangeUs = trackChangeIt != m_lastLogicalTrackChangeAt.end()
       ? std::chrono::duration_cast<std::chrono::microseconds>(now - trackChangeIt->second).count()
       : 0;
-  const double currentRate = sanitizeRate(playerIt->second.rate);
+  const double currentRate = playerIt->second.rate;
   const double absRate = std::abs(currentRate);
   const double expandedRate = std::max(1.0, absRate);
   const auto maxPlausibleTrackPositionUs = scaleDurationUs(elapsedSinceTrackChangeUs, expandedRate)
@@ -619,9 +618,7 @@ void MprisService::applyPositionSample(const std::string& busName, int64_t rawPo
           + std::chrono::duration_cast<std::chrono::microseconds>(kRecentTrackChangeSlack).count();
       const auto minExpectedProgressUs = scaleDurationUs(kPositionCandidateMinProgressUs, std::min(1.0, absRate));
 
-      if (directionalProgressUs >= 0
-          && directionalProgressUs < minExpectedProgressUs
-          && directionalProgressUs <= maxExpectedProgressUs) {
+      if (directionalProgressUs >= 0 && directionalProgressUs < minExpectedProgressUs) {
         // Media is progressing in the expected direction, but hasn't accumulated enough delta yet (e.g. slow playback).
         if (shouldRetryPropertiesRefresh(busName)) {
           schedulePositionRefreshRetry(busName, kPositionCandidateRetryInterval, false);
@@ -720,8 +717,7 @@ std::int64_t MprisService::projectedPositionUs(const MprisPlayerInfo& player) co
       const auto elapsedUs =
           std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - it->second).count();
       if (elapsedUs > 0) {
-        const double rate = sanitizeRate(player.rate);
-        projectedUs += scaleDurationUs(elapsedUs, rate);
+        projectedUs += scaleDurationUs(elapsedUs, player.rate);
       }
     }
   }
@@ -1135,46 +1131,6 @@ bool MprisService::setVolumeActive(double volume) {
   return setVolume(*active, volume);
 }
 
-bool MprisService::setRate(const std::string& busName, double rate) {
-  if (!std::isfinite(rate) || rate < kMinPlaybackRate || rate > kMaxPlaybackRate) {
-    return false;
-  }
-
-  // MPRIS treats Rate 0.0 as a pause request, not as a stored rate.
-  if (rate == 0.0) {
-    return pause(busName);
-  }
-
-  const auto it = m_players.find(busName);
-  if (it == m_players.end()) {
-    return false;
-  }
-
-  const auto proxyIt = m_playerProxies.find(busName);
-  if (proxyIt == m_playerProxies.end()) {
-    return false;
-  }
-
-  try {
-    proxyIt->second->callMethodAsync("Set")
-        .onInterface(kPropertiesInterface)
-        .withArguments(std::string{kMprisPlayerInterface}, std::string{"Rate"}, sdbus::Variant{rate})
-        .uponReplyInvoke(makeAsyncReplyHandler("set-rate", busName));
-    return true;
-  } catch (const sdbus::Error& e) {
-    kLog.warn("set-rate dispatch failed name={} err={}", busName, e.what());
-    return false;
-  }
-}
-
-bool MprisService::setRateActive(double rate) {
-  const auto active = chooseActivePlayer();
-  if (!active.has_value()) {
-    return false;
-  }
-  return setRate(*active, rate);
-}
-
 bool MprisService::setShuffle(const std::string& busName, bool shuffle) {
   const auto it = m_players.find(busName);
   if (it == m_players.end()) {
@@ -1271,22 +1227,6 @@ std::optional<double> MprisService::volumeActive() const {
     return std::nullopt;
   }
   return volume(*active);
-}
-
-std::optional<double> MprisService::rate(const std::string& busName) const {
-  const auto it = m_players.find(busName);
-  if (it == m_players.end()) {
-    return std::nullopt;
-  }
-  return it->second.rate;
-}
-
-std::optional<double> MprisService::rateActive() const {
-  const auto active = chooseActivePlayer();
-  if (!active.has_value()) {
-    return std::nullopt;
-  }
-  return rate(*active);
 }
 
 std::optional<bool> MprisService::shuffle(const std::string& busName) const {
@@ -1498,27 +1438,6 @@ void MprisService::registerControlApi() {
               .withInputParamNames("volume")
               .withOutputParamNames("success")
               .implementedAs([this](double volume) { return onSetVolumeActive(volume); }),
-
-          sdbus::registerMethod("GetRatePlayer")
-              .withInputParamNames("player_bus_name")
-              .withOutputParamNames("rate")
-              .implementedAs([this](const std::string& busName) { return onGetRatePlayer(busName); }),
-
-          sdbus::registerMethod("GetRateActive").withOutputParamNames("rate").implementedAs([this] {
-            return onGetRateActive();
-          }),
-
-          sdbus::registerMethod("SetRatePlayer")
-              .withInputParamNames("player_bus_name", "rate")
-              .withOutputParamNames("success")
-              .implementedAs([this](const std::string& busName, double rate) {
-                return onSetRatePlayer(busName, rate);
-              }),
-
-          sdbus::registerMethod("SetRateActive")
-              .withInputParamNames("rate")
-              .withOutputParamNames("success")
-              .implementedAs([this](double rate) { return onSetRateActive(rate); }),
 
           sdbus::registerMethod("GetShufflePlayer")
               .withInputParamNames("player_bus_name")
@@ -2211,7 +2130,7 @@ void MprisService::applyPlayerSnapshot(
         const std::int64_t elapsedSinceSampleUs = sampleIt != m_lastPositionSampleAt.end()
             ? std::chrono::duration_cast<std::chrono::microseconds>(now - sampleIt->second).count()
             : 0;
-        const double expandedRate = std::max(1.0, std::abs(sanitizeRate(previous_info.rate)));
+        const double expandedRate = std::max(1.0, std::abs(previous_info.rate));
         const auto scaledElapsedUs = scaleDurationUs(elapsedSinceSampleUs, expandedRate);
         const std::int64_t rawDeltaUs = std::llabs(merged.positionUs - previous_info.positionUs);
         const std::int64_t maxReasonableDeltaUs = std::max<std::int64_t>(5'000'000, scaledElapsedUs + 2'000'000);
@@ -2836,58 +2755,6 @@ bool MprisService::onSetVolumeActive(double volume) {
     throw sdbus::Error(sdbus::Error::Name{"dev.noctalia.Mpris.Error.NotFound"}, "no active player available");
   }
   return onSetVolumePlayer(*active, volume);
-}
-
-double MprisService::onGetRatePlayer(const std::string& busName) const {
-  if (busName.empty()) {
-    throw sdbus::Error(sdbus::Error::Name{"dev.noctalia.Mpris.Error.InvalidArgs"}, "player_bus_name must not be empty");
-  }
-
-  const auto currentRate = rate(busName);
-  if (!currentRate.has_value()) {
-    throw sdbus::Error(sdbus::Error::Name{"dev.noctalia.Mpris.Error.NotFound"}, "player was not found");
-  }
-  return *currentRate;
-}
-
-double MprisService::onGetRateActive() const {
-  const auto currentRate = rateActive();
-  if (!currentRate.has_value()) {
-    throw sdbus::Error(sdbus::Error::Name{"dev.noctalia.Mpris.Error.NotFound"}, "no active player available");
-  }
-  return *currentRate;
-}
-
-bool MprisService::onSetRatePlayer(const std::string& busName, double rate) {
-  if (busName.empty()) {
-    throw sdbus::Error(sdbus::Error::Name{"dev.noctalia.Mpris.Error.InvalidArgs"}, "player_bus_name must not be empty");
-  }
-
-  if (!std::isfinite(rate) || rate < kMinPlaybackRate || rate > kMaxPlaybackRate) {
-    throw sdbus::Error(
-        sdbus::Error::Name{"dev.noctalia.Mpris.Error.InvalidArgs"},
-        "rate must be a finite number between -64.0 and 64.0"
-    );
-  }
-
-  if (!m_players.contains(busName)) {
-    throw sdbus::Error(sdbus::Error::Name{"dev.noctalia.Mpris.Error.NotFound"}, "player was not found");
-  }
-
-  if (!setRate(busName, rate)) {
-    throw sdbus::Error(
-        sdbus::Error::Name{"dev.noctalia.Mpris.Error.NotSupported"}, "player does not support Rate updates"
-    );
-  }
-  return true;
-}
-
-bool MprisService::onSetRateActive(double rate) {
-  const auto active = chooseActivePlayer();
-  if (!active.has_value()) {
-    throw sdbus::Error(sdbus::Error::Name{"dev.noctalia.Mpris.Error.NotFound"}, "no active player available");
-  }
-  return onSetRatePlayer(*active, rate);
 }
 
 bool MprisService::onGetShufflePlayer(const std::string& busName) const {
